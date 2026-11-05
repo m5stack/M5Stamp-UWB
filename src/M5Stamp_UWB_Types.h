@@ -73,8 +73,8 @@ enum class M5Stamp_UWBDataRate : uint8_t {
 };
 
 enum class M5Stamp_UWBChannel : uint8_t {
-    Channel5 = 5,
-    Channel9 = 9,
+    Channel5 = 5,  //!< Not supported: rejected by begin()/init() for Japan.
+    Channel9 = 9,  //!< The only supported profile.
 };
 
 enum class M5Stamp_UWBPreambleLength : uint16_t {

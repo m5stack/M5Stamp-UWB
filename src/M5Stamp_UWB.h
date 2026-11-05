@@ -98,6 +98,14 @@ public:
 
     bool isConnected() const;
     bool isInitialized() const;
+
+    /**
+     * @brief Return true when DW_IRQ is attached and its interrupt mask is armed.
+     */
+    bool isIrqActive() const;
+
+    /** @brief Backwards-compatible alias for isIrqActive(). */
+    bool isInterruptDriven() const;
     M5Stamp_UWBError lastError() const;
     const char* lastErrorName() const;
     const M5Stamp_UWBConfig& config() const;

@@ -9,6 +9,11 @@
 
 #include <cstring>
 
+#include <esp_attr.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
+
 extern "C" {
 #include "qm33120w_sdk/deca_device_api.h"
 #include "qm33120w_sdk/deca_interface.h"
@@ -54,6 +59,133 @@ struct M5Stamp_UWB::Impl {
 };
 
 M5Stamp_UWB* M5Stamp_UWB::_active = nullptr;
+
+/* --------------------------------------------------------------------------
+ * DW_IRQ driven wait.
+ *
+ * DW_IRQ is a level-sensitive, active-high line: it stays high while any
+ * enabled SYS_STATUS bit is pending. The ISR only wakes the task; every SPI
+ * access stays in task context. The wait itself blocks until the line rises or
+ * the caller's timeout expires, instead of polling once per millisecond.
+ *
+ * The semaphore is drained at the start of every public operation, and a
+ * pending bit outside the current wait mask is cleared so it cannot hold the
+ * line high and swallow the edge for the event we are actually waiting for.
+ * -------------------------------------------------------------------------- */
+static SemaphoreHandle_t s_irq_sem = nullptr;
+static bool s_irq_attached         = false;
+static bool s_irq_enabled          = false;
+static int8_t s_irq_pin            = M5STAMP_UWB_PIN_UNUSED;
+
+static constexpr uint32_t kIrqRxMask =
+    static_cast<uint32_t>(DWT_INT_RXFCG_BIT_MASK) | SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR;
+static constexpr uint32_t kIrqMask = kIrqRxMask | static_cast<uint32_t>(DWT_INT_TXFRS_BIT_MASK);
+
+static void IRAM_ATTR uwbIrqIsr()
+{
+    if (s_irq_sem == nullptr) {
+        return;
+    }
+    BaseType_t higher_priority_task_woken = pdFALSE;
+    xSemaphoreGiveFromISR(s_irq_sem, &higher_priority_task_woken);
+    if (higher_priority_task_woken == pdTRUE) {
+        portYIELD_FROM_ISR();
+    }
+}
+
+static void irqDrain()
+{
+    if (s_irq_sem == nullptr) {
+        return;
+    }
+    while (xSemaphoreTake(s_irq_sem, 0) == pdTRUE) {
+    }
+}
+
+static void irqAttach(int8_t pin)
+{
+    if (s_irq_attached || (pin == M5STAMP_UWB_PIN_UNUSED)) {
+        return;
+    }
+    const int irq = digitalPinToInterrupt(pin);
+    if (irq < 0) {
+        return;
+    }
+    if (s_irq_sem == nullptr) {
+        s_irq_sem = xSemaphoreCreateBinary();
+        if (s_irq_sem == nullptr) {
+            return;
+        }
+    }
+    pinMode(pin, INPUT);
+    attachInterrupt(irq, uwbIrqIsr, RISING);
+    s_irq_pin      = pin;
+    s_irq_attached = true;
+}
+
+static void irqDetach()
+{
+    if (!s_irq_attached) {
+        return;
+    }
+    const int irq = digitalPinToInterrupt(s_irq_pin);
+    if (irq >= 0) {
+        detachInterrupt(irq);
+    }
+    s_irq_attached = false;
+    s_irq_enabled  = false;
+    s_irq_pin      = M5STAMP_UWB_PIN_UNUSED;
+    irqDrain();
+}
+
+static void irqEnable()
+{
+    if (!s_irq_attached) {
+        s_irq_enabled = false;
+        return;
+    }
+    /* dwt_configure() clears SYS_ENABLE_LO, so this must follow every configure. */
+    dwt_setinterrupt(kIrqMask, 0, DWT_ENABLE_INT_ONLY);
+    dwt_writesysstatuslo(kIrqMask);
+    irqDrain();
+    s_irq_enabled = true;
+}
+
+static void irqDisable()
+{
+    if (!s_irq_enabled) {
+        return;
+    }
+    dwt_setinterrupt(0, 0, DWT_ENABLE_INT_ONLY);
+    s_irq_enabled = false;
+}
+
+/* Block until DW_IRQ or the remaining timeout. `status` is the value the caller
+ * just read; `mask` is the event it is waiting for. */
+static void irqWait(uint32_t status, uint32_t mask, uint32_t start_ms, uint32_t timeout_ms)
+{
+    if (!s_irq_attached || !s_irq_enabled) {
+        delay(1);
+        return;
+    }
+
+    const uint32_t elapsed = millis() - start_ms;
+    if (elapsed >= timeout_ms) {
+        return;
+    }
+
+    const uint32_t stale = status & kIrqMask & ~mask;
+    if (stale != 0) {
+        dwt_writesysstatuslo(stale);
+        return;
+    }
+
+    TickType_t ticks = pdMS_TO_TICKS(timeout_ms - elapsed);
+    if (ticks == 0) {
+        ticks = 1;
+    }
+    (void)xSemaphoreTake(s_irq_sem, ticks);
+}
 
 static uint16_t pacSymbols(M5Stamp_UWBPacSize pacSize)
 {
@@ -190,24 +322,18 @@ static uint8_t channelNumber(M5Stamp_UWBChannel channel)
 
 static bool isValidChannel(M5Stamp_UWBChannel channel)
 {
-    return (channel == M5Stamp_UWBChannel::Channel5) || (channel == M5Stamp_UWBChannel::Channel9);
+    /* CH5 is intentionally unsupported: Japanese radio regulations only allow
+     * the CH9 profile for this product. Keep the enum value for source
+     * compatibility, but reject it before dwt_configure(). */
+    return channel == M5Stamp_UWBChannel::Channel9;
 }
 
 static M5Stamp_UWBPHYConfig recommendedPHYProfile(M5Stamp_UWBChannel channel)
 {
+    (void)channel;
     M5Stamp_UWBPHYConfig phy;
-    phy.channel = channel;
-
-    switch (channel) {
-        case M5Stamp_UWBChannel::Channel9:
-            phy.channel = M5Stamp_UWBChannel::Channel9;
-            break;
-        case M5Stamp_UWBChannel::Channel5:
-        default:
-            phy.channel = M5Stamp_UWBChannel::Channel5;
-            break;
-    }
-
+    /* The library is locked to the CH9 profile. */
+    phy.channel = M5Stamp_UWBChannel::Channel9;
     return phy;
 }
 
@@ -415,6 +541,8 @@ bool M5Stamp_UWB::begin(const M5Stamp_UWBConfig& config, const M5Stamp_UWBPHYCon
 
     auto cleanupBeginFailure = [this]() {
         const M5Stamp_UWBError error = _impl->last_error;
+        irqDisable();
+        irqDetach();
         if (_active == this) {
             _active = nullptr;
         }
@@ -443,6 +571,7 @@ bool M5Stamp_UWB::begin(const M5Stamp_UWBConfig& config, const M5Stamp_UWBPHYCon
     }
     if (_impl->config.pin_irq != M5STAMP_UWB_PIN_UNUSED) {
         pinMode(_impl->config.pin_irq, INPUT);
+        irqAttach(_impl->config.pin_irq);
     }
     if (_impl->config.pin_gp7 != M5STAMP_UWB_PIN_UNUSED) {
         pinMode(_impl->config.pin_gp7, INPUT);
@@ -495,8 +624,11 @@ void M5Stamp_UWB::end()
     const bool hadDriver = wasActive || _impl->connected || _impl->initialized;
 
     if (wasActive && _impl->initialized) {
+        irqDisable();
         dwt_forcetrxoff();
     }
+
+    irqDetach();
 
     if (wasActive) {
         _active = nullptr;
@@ -554,6 +686,9 @@ bool M5Stamp_UWB::init(const M5Stamp_UWBPHYConfig& phy)
         dwt_setlnapamode(DWT_LNA_ENABLE | DWT_PA_ENABLE);
     }
 
+    /* dwt_configure() cleared SYS_ENABLE_LO: re-arm the IRQ mask after it. */
+    irqEnable();
+
     _impl->initialized = true;
     setError(M5Stamp_UWBError::Ok);
     return true;
@@ -587,6 +722,8 @@ bool M5Stamp_UWB::probe()
 
 void M5Stamp_UWB::hardReset(uint32_t reset_low_ms, uint32_t startup_ms)
 {
+    /* The chip loses its interrupt enable bits across reset. */
+    irqDisable();
     if (_impl->config.pin_rst == M5STAMP_UWB_PIN_UNUSED) {
         delay(startup_ms);
         return;
@@ -640,6 +777,7 @@ M5Stamp_UWBTxResult M5Stamp_UWB::sendFrame(const uint8_t* payload, size_t length
                                            uint32_t timeoutMs)
 {
     M5Stamp_UWBTxResult result;
+    irqDrain();
 
     if (!_impl->initialized) {
         result.error = M5Stamp_UWBError::ConfigFailed;
@@ -692,7 +830,7 @@ M5Stamp_UWBTxResult M5Stamp_UWB::sendFrame(const uint8_t* payload, size_t length
             setError(M5Stamp_UWBError::Ok);
             return result;
         }
-        delay(1);
+        irqWait(status, DWT_INT_TXFRS_BIT_MASK, startMs, timeoutMs);
     }
 
     stopRadioAndClearTxStatus();
@@ -704,6 +842,7 @@ M5Stamp_UWBTxResult M5Stamp_UWB::sendFrame(const uint8_t* payload, size_t length
 M5Stamp_UWBRxResult M5Stamp_UWB::receiveFrame(uint8_t* payload, size_t payloadSize, uint32_t timeoutMs)
 {
     M5Stamp_UWBRxResult result;
+    irqDrain();
 
     if (!_impl->initialized) {
         result.error = M5Stamp_UWBError::ConfigFailed;
@@ -772,7 +911,7 @@ M5Stamp_UWBRxResult M5Stamp_UWB::receiveFrame(uint8_t* payload, size_t payloadSi
             setError(result.error);
             return result;
         }
-        delay(1);
+        irqWait(status, kIrqRxMask, startMs, timeoutMs);
     }
 
     stopRadioAndClearRxStatus();
@@ -788,6 +927,7 @@ M5Stamp_UWBRangeResult M5Stamp_UWB::requestRange(const M5Stamp_UWBRangeConfig& r
     static constexpr uint64_t uusToDwtTime = 65536ULL;
 
     M5Stamp_UWBRangeResult result;
+    irqDrain();
     if (!_impl->initialized) {
         result.error = M5Stamp_UWBError::ConfigFailed;
         setError(result.error);
@@ -878,7 +1018,7 @@ M5Stamp_UWBRangeResult M5Stamp_UWB::requestRange(const M5Stamp_UWBRangeConfig& r
             setError(result.error);
             return result;
         }
-        delay(1);
+        irqWait(status, kIrqRxMask, startMs, range.hostTimeoutMs);
     }
 
     stopRadioAndClearRxStatus();
@@ -893,6 +1033,7 @@ M5Stamp_UWBResponderResult M5Stamp_UWB::respondRange(const M5Stamp_UWBRangeConfi
     static constexpr uint64_t uusToDwtTime = 65536ULL;
 
     M5Stamp_UWBResponderResult result;
+    irqDrain();
     if (!_impl->initialized) {
         result.error = M5Stamp_UWBError::ConfigFailed;
         setError(result.error);
@@ -981,7 +1122,7 @@ M5Stamp_UWBResponderResult M5Stamp_UWB::respondRange(const M5Stamp_UWBRangeConfi
                     setError(M5Stamp_UWBError::Ok);
                     return result;
                 }
-                delay(1);
+                irqWait(txStatus, DWT_INT_TXFRS_BIT_MASK, txStartMs, 20);
             }
 
             stopRadioAndClearTxStatus();
@@ -997,7 +1138,7 @@ M5Stamp_UWBResponderResult M5Stamp_UWB::respondRange(const M5Stamp_UWBRangeConfi
             setError(result.error);
             return result;
         }
-        delay(1);
+        irqWait(status, kIrqRxMask, startMs, range.hostTimeoutMs);
     }
 
     stopRadioAndClearRxStatus();
@@ -1013,6 +1154,7 @@ M5Stamp_UWBDSRangeResult M5Stamp_UWB::requestDSRange(const M5Stamp_UWBDSRangeCon
     static constexpr uint64_t uusToDwtTime = 65536ULL;
 
     M5Stamp_UWBDSRangeResult result;
+    irqDrain();
     if (!_impl->initialized) {
         result.error = M5Stamp_UWBError::ConfigFailed;
         setError(result.error);
@@ -1066,7 +1208,7 @@ M5Stamp_UWBDSRangeResult M5Stamp_UWB::requestDSRange(const M5Stamp_UWBDSRangeCon
             setError(result.error);
             return result;
         }
-        delay(1);
+        irqWait(status, kIrqRxMask, startMs, range.hostTimeoutMs);
     }
 
     M5Stamp_UWBRxResult parsed;
@@ -1135,7 +1277,7 @@ M5Stamp_UWBDSRangeResult M5Stamp_UWB::requestDSRange(const M5Stamp_UWBDSRangeCon
             setError(result.error);
             return result;
         }
-        delay(1);
+        irqWait(status, kIrqRxMask, resultStartMs, range.hostTimeoutMs);
     }
 
     if (!parseShortAddressFrame(distFrame, distLen, parsed) || !payloadMatches(distFrame, distLen, "DWD", 3, 7) ||
@@ -1166,6 +1308,7 @@ M5Stamp_UWBDSResponderResult M5Stamp_UWB::respondDSRange(const M5Stamp_UWBDSRang
     static constexpr uint64_t uusToDwtTime = 65536ULL;
 
     M5Stamp_UWBDSResponderResult result;
+    irqDrain();
     if (!_impl->initialized) {
         result.error = M5Stamp_UWBError::ConfigFailed;
         setError(result.error);
@@ -1207,7 +1350,7 @@ M5Stamp_UWBDSResponderResult M5Stamp_UWB::respondDSRange(const M5Stamp_UWBDSRang
             setError(result.error);
             return result;
         }
-        delay(1);
+        irqWait(status, kIrqRxMask, startMs, range.hostTimeoutMs);
     }
 
     if (!parseShortAddressFrame(pollFrame, pollLen, parsed) || !payloadMatches(pollFrame, pollLen, "DWP", 3, 3) ||
@@ -1274,7 +1417,7 @@ M5Stamp_UWBDSResponderResult M5Stamp_UWB::respondDSRange(const M5Stamp_UWBDSRang
             setError(result.error);
             return result;
         }
-        delay(1);
+        irqWait(status, kIrqRxMask, finalStartMs, range.hostTimeoutMs);
     }
 
     M5Stamp_UWBRxResult finalParsed;
@@ -1340,13 +1483,14 @@ M5Stamp_UWBDSResponderResult M5Stamp_UWB::respondDSRange(const M5Stamp_UWBDSRang
         bool txDone              = false;
         const uint32_t txStartMs = millis();
         while ((millis() - txStartMs) < 20) {
-            if ((dwt_readsysstatuslo() & DWT_INT_TXFRS_BIT_MASK) != 0) {
+            const uint32_t txStatus = dwt_readsysstatuslo();
+            if ((txStatus & DWT_INT_TXFRS_BIT_MASK) != 0) {
                 dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK);
                 txDone = true;
                 sentCount++;
                 break;
             }
-            delay(1);
+            irqWait(txStatus, DWT_INT_TXFRS_BIT_MASK, txStartMs, 20);
         }
         if (!txDone) {
             stopRadioAndClearTxStatus();
@@ -1368,6 +1512,16 @@ M5Stamp_UWBDSResponderResult M5Stamp_UWB::respondDSRange(const M5Stamp_UWBDSRang
 bool M5Stamp_UWB::isConnected() const
 {
     return _impl->connected;
+}
+
+bool M5Stamp_UWB::isIrqActive() const
+{
+    return s_irq_attached && s_irq_enabled;
+}
+
+bool M5Stamp_UWB::isInterruptDriven() const
+{
+    return isIrqActive();
 }
 
 bool M5Stamp_UWB::isInitialized() const
